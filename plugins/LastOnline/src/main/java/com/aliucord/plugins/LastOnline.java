@@ -4,6 +4,7 @@ import android.content.Context;
 import android.graphics.Color;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.aliucord.annotations.AliucordPlugin;
@@ -27,95 +28,66 @@ public class LastOnline extends Plugin {
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. تتبع StoreUserPresence لتسجيل الحالات الحية
-        try {
-            patcher.patch(
-                StoreStream.getPresences().getClass().getDeclaredMethod("onPresencesLoaded", Map.class),
-                new Hook(param -> recordPresences(param.args[0]))
-            );
-        } catch (Throwable ignored) {}
-
+        // 1. Hook StoreUserPresence to record real-time gateway presence updates
         try {
             for (java.lang.reflect.Method m : StoreStream.getPresences().getClass().getDeclaredMethods()) {
-                if (m.getName().equals("handlePresenceUpdate")) {
+                if (m.getName().equals("handlePresenceUpdate") || m.getName().equals("onPresencesLoaded")) {
                     patcher.patch(m, new Hook(param -> {
                         if (param.args.length > 0 && param.args[0] != null) {
-                            extractAndSavePresence(param.args[0]);
+                            processPresenceData(param.args[0]);
                         }
                     }));
                 }
             }
         } catch (Throwable ignored) {}
 
-        // 2. نفس Hook إضافة BetterUserDetails بالضبط (WidgetUserSheet.configureNote)
+        // 2. Exact hook used to render profile details in the user sheet
         ClassLoader classLoader = context.getClassLoader();
         Class<?> userSheetClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
-        Class<?> loadedClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
 
-        patcher.patch(
-            userSheetClass.getDeclaredMethod("configureNote", loadedClass),
-            new Hook(param -> {
-                try {
-                    Object sheet = param.thisObject;
-                    Object loadedState = param.args[0];
-                    if (loadedState == null) return;
-
-                    User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
-                    if (user == null) return;
-
-                    long userId = user.getId();
-
-                    // الوصول للـ View عبر Binding
-                    Object binding = ReflectUtils.getField(sheet, "binding");
-                    if (binding == null) return;
-
-                    View aboutMeCard = (View) ReflectUtils.getField(binding, "aboutMeCard");
-                    if (aboutMeCard == null || !(aboutMeCard.getParent() instanceof ViewGroup)) return;
-
-                    ViewGroup parent = (ViewGroup) aboutMeCard.getParent();
-                    parent.post(() -> injectRow(parent, aboutMeCard, userId));
-                } catch (Throwable ignored) {}
-            })
-        );
-    }
-
-    private void recordPresences(Object mapObj) {
-        if (!(mapObj instanceof Map)) return;
-        Map<?, ?> map = (Map<?, ?>) mapObj;
-        for (Map.Entry<?, ?> entry : map.entrySet()) {
-            if (entry.getValue() != null) {
-                long uid = 0L;
-                if (entry.getKey() instanceof Number) {
-                    uid = ((Number) entry.getKey()).longValue();
-                } else if (entry.getKey() instanceof String) {
+        for (java.lang.reflect.Method method : userSheetClass.getDeclaredMethods()) {
+            if (method.getName().equals("onViewBound")) {
+                patcher.patch(method, new Hook(param -> {
                     try {
-                        uid = Long.parseLong((String) entry.getKey());
+                        Object sheet = param.thisObject;
+                        View rootView = (View) param.args[0];
+                        hookSheetBinding(sheet, rootView);
                     } catch (Throwable ignored) {}
-                }
-                saveIfActive(uid, entry.getValue());
+                }));
             }
         }
     }
 
-    private void extractAndSavePresence(Object presenceObj) {
+    private void processPresenceData(Object data) {
         try {
-            long uid = 0L;
-            try {
-                Object user = ReflectUtils.invokeMethod(presenceObj, "getUser");
-                if (user instanceof User) {
-                    uid = ((User) user).getId();
+            if (data instanceof Map) {
+                Map<?, ?> map = (Map<?, ?>) data;
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    long uid = 0L;
+                    if (entry.getKey() instanceof Number) {
+                        uid = ((Number) entry.getKey()).longValue();
+                    } else if (entry.getKey() instanceof String) {
+                        try { uid = Long.parseLong((String) entry.getKey()); } catch (Throwable ignored) {}
+                    }
+                    saveIfActive(uid, entry.getValue());
                 }
-            } catch (Throwable ignored) {}
-
-            if (uid == 0L) {
+            } else {
+                long uid = 0L;
                 try {
-                    Object idObj = ReflectUtils.getField(presenceObj, "userId");
-                    if (idObj instanceof Number) uid = ((Number) idObj).longValue();
+                    Object user = ReflectUtils.invokeMethod(data, "getUser");
+                    if (user instanceof User) uid = ((User) user).getId();
                 } catch (Throwable ignored) {}
-            }
 
-            if (uid != 0L) {
-                saveIfActive(uid, presenceObj);
+                if (uid == 0L) {
+                    try {
+                        Object idObj = ReflectUtils.getField(data, "userId");
+                        if (idObj instanceof Number) uid = ((Number) idObj).longValue();
+                    } catch (Throwable ignored) {}
+                }
+
+                if (uid != 0L) {
+                    saveIfActive(uid, data);
+                }
             }
         } catch (Throwable ignored) {}
     }
@@ -128,46 +100,91 @@ public class LastOnline extends Plugin {
         }
     }
 
-    private void injectRow(ViewGroup parent, View anchor, long userId) {
-        try {
-            Context ctx = parent.getContext();
-            TextView tv = parent.findViewById(VIEW_ID);
+    private void hookSheetBinding(Object sheet, View rootView) {
+        rootView.post(() -> {
+            try {
+                // Retrieve the user ID currently open in the sheet
+                long userId = 0L;
+                try {
+                    Object viewModel = ReflectUtils.getField(sheet, "viewModel");
+                    Object viewState = ReflectUtils.invokeMethod(viewModel, "getViewState");
+                    Object user = ReflectUtils.invokeMethod(viewState, "getUser");
+                    if (user instanceof User) userId = ((User) user).getId();
+                } catch (Throwable ignored) {}
 
-            long lastSeen = settings.getLong(String.valueOf(userId), 0L);
-            String text;
-
-            if (lastSeen > 0) {
-                long diff = System.currentTimeMillis() - lastSeen;
-                long days = diff / (1000 * 60 * 60 * 24);
-
-                if (diff < 60000) {
-                    text = "Last online: Active Now";
-                } else if (days == 0) {
-                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
-                } else {
-                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
+                if (userId == 0L) {
+                    android.os.Bundle args = (android.os.Bundle) ReflectUtils.invokeMethod(sheet, "getArguments");
+                    if (args != null) {
+                        if (args.containsKey("USER_ID")) userId = args.getLong("USER_ID");
+                        else if (args.containsKey("user_id")) userId = args.getLong("user_id");
+                    }
                 }
-            } else {
-                text = "Last online: Unknown (No data recorded)";
-            }
 
-            if (tv == null) {
-                tv = new TextView(ctx);
-                tv.setId(VIEW_ID);
-                tv.setTextSize(12f);
-                tv.setTextColor(Color.parseColor("#B9BBBE"));
+                if (userId == 0L) return;
 
-                int padStart = DimenUtils.dpToPx(16);
-                int padBottom = DimenUtils.dpToPx(2);
-                tv.setPadding(padStart, 0, padStart, padBottom);
+                // Find user_sheet_content and about_me_card directly in the view tree
+                Context ctx = rootView.getContext();
+                int contentId = ctx.getResources().getIdentifier("user_sheet_content", "id", ctx.getPackageName());
+                int aboutMeId = ctx.getResources().getIdentifier("about_me_card", "id", ctx.getPackageName());
 
-                // وضعه مباشرة قبل كارت About Me ليظهر أسفل Last message
-                int index = parent.indexOfChild(anchor);
-                parent.addView(tv, Math.max(0, index));
-            }
+                ViewGroup targetContainer = null;
+                View aboutMeCard = null;
 
-            tv.setText(text);
-        } catch (Throwable ignored) {}
+                if (contentId != 0) {
+                    View cv = rootView.findViewById(contentId);
+                    if (cv instanceof ViewGroup) targetContainer = (ViewGroup) cv;
+                }
+
+                if (aboutMeId != 0) {
+                    aboutMeCard = rootView.findViewById(aboutMeId);
+                    if (aboutMeCard != null && targetContainer == null && aboutMeCard.getParent() instanceof ViewGroup) {
+                        targetContainer = (ViewGroup) aboutMeCard.getParent();
+                    }
+                }
+
+                if (targetContainer == null) return;
+
+                TextView tv = targetContainer.findViewById(VIEW_ID);
+
+                long lastSeen = settings.getLong(String.valueOf(userId), 0L);
+                String text;
+
+                if (lastSeen > 0) {
+                    long diff = System.currentTimeMillis() - lastSeen;
+                    long days = diff / (1000 * 60 * 60 * 24);
+
+                    if (diff < 60000) {
+                        text = "Last online: Active Now";
+                    } else if (days == 0) {
+                        text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
+                    } else {
+                        text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
+                    }
+                } else {
+                    text = "Last online: Unknown (No data recorded)";
+                }
+
+                if (tv == null) {
+                    tv = new TextView(ctx);
+                    tv.setId(VIEW_ID);
+                    tv.setTextSize(12f);
+                    tv.setTextColor(Color.parseColor("#B9BBBE"));
+
+                    int padH = DimenUtils.dpToPx(16);
+                    int padV = DimenUtils.dpToPx(2);
+                    tv.setPadding(padH, padV, padH, padV);
+
+                    if (aboutMeCard != null && targetContainer.indexOfChild(aboutMeCard) != -1) {
+                        int index = targetContainer.indexOfChild(aboutMeCard);
+                        targetContainer.addView(tv, index);
+                    } else {
+                        targetContainer.addView(tv);
+                    }
+                }
+
+                tv.setText(text);
+            } catch (Throwable ignored) {}
+        });
     }
 
     @Override
