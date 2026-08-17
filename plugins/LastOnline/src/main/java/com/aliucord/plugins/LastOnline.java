@@ -4,7 +4,6 @@ import android.content.Context;
 import android.graphics.Color;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.aliucord.annotations.AliucordPlugin;
@@ -12,7 +11,6 @@ import com.aliucord.entities.Plugin;
 import com.aliucord.patcher.Hook;
 import com.aliucord.utils.DimenUtils;
 import com.aliucord.utils.ReflectUtils;
-import com.discord.models.presence.Presence;
 import com.discord.models.user.User;
 import com.discord.stores.StoreStream;
 
@@ -29,7 +27,7 @@ public class LastOnline extends Plugin {
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Hook على StoreUserPresence لتسجيل الحالات الحية
+        // 1. تتبع StoreUserPresence لتسجيل الحالات الحية
         try {
             patcher.patch(
                 StoreStream.getPresences().getClass().getDeclaredMethod("onPresencesLoaded", Map.class),
@@ -38,15 +36,15 @@ public class LastOnline extends Plugin {
         } catch (Throwable ignored) {}
 
         try {
-            patcher.patch(
-                StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Presence.class),
-                new Hook(param -> {
-                    if (param.args[0] instanceof Presence) {
-                        Presence p = (Presence) param.args[0];
-                        checkAndSave(p.getUserId(), p);
-                    }
-                })
-            );
+            for (java.lang.reflect.Method m : StoreStream.getPresences().getClass().getDeclaredMethods()) {
+                if (m.getName().equals("handlePresenceUpdate")) {
+                    patcher.patch(m, new Hook(param -> {
+                        if (param.args.length > 0 && param.args[0] != null) {
+                            extractAndSavePresence(param.args[0]);
+                        }
+                    }));
+                }
+            }
         } catch (Throwable ignored) {}
 
         // 2. نفس Hook إضافة BetterUserDetails بالضبط (WidgetUserSheet.configureNote)
@@ -85,22 +83,48 @@ public class LastOnline extends Plugin {
         if (!(mapObj instanceof Map)) return;
         Map<?, ?> map = (Map<?, ?>) mapObj;
         for (Map.Entry<?, ?> entry : map.entrySet()) {
-            if (entry.getValue() instanceof Presence) {
+            if (entry.getValue() != null) {
                 long uid = 0L;
-                if (entry.getKey() instanceof Number) uid = ((Number) entry.getKey()).longValue();
-                checkAndSave(uid, (Presence) entry.getValue());
+                if (entry.getKey() instanceof Number) {
+                    uid = ((Number) entry.getKey()).longValue();
+                } else if (entry.getKey() instanceof String) {
+                    try {
+                        uid = Long.parseLong((String) entry.getKey());
+                    } catch (Throwable ignored) {}
+                }
+                saveIfActive(uid, entry.getValue());
             }
         }
     }
 
-    private void checkAndSave(long userId, Presence presence) {
-        if (presence == null) return;
-        String status = String.valueOf(presence.getStatus()).toLowerCase(Locale.ROOT);
-        if (status.contains("online") || status.contains("idle") || status.contains("dnd")) {
-            long now = System.currentTimeMillis();
-            if (userId != 0L) {
-                settings.setLong(String.valueOf(userId), now);
+    private void extractAndSavePresence(Object presenceObj) {
+        try {
+            long uid = 0L;
+            try {
+                Object user = ReflectUtils.invokeMethod(presenceObj, "getUser");
+                if (user instanceof User) {
+                    uid = ((User) user).getId();
+                }
+            } catch (Throwable ignored) {}
+
+            if (uid == 0L) {
+                try {
+                    Object idObj = ReflectUtils.getField(presenceObj, "userId");
+                    if (idObj instanceof Number) uid = ((Number) idObj).longValue();
+                } catch (Throwable ignored) {}
             }
+
+            if (uid != 0L) {
+                saveIfActive(uid, presenceObj);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void saveIfActive(long userId, Object presenceObj) {
+        if (presenceObj == null || userId == 0L) return;
+        String status = String.valueOf(presenceObj).toLowerCase(Locale.ROOT);
+        if (status.contains("online") || status.contains("idle") || status.contains("dnd")) {
+            settings.setLong(String.valueOf(userId), System.currentTimeMillis());
         }
     }
 
@@ -137,7 +161,7 @@ public class LastOnline extends Plugin {
                 int padBottom = DimenUtils.dpToPx(2);
                 tv.setPadding(padStart, 0, padStart, padBottom);
 
-                // وضعه مباشرة قبل كارت About Me (نفس مكان تفاصيل BetterUserDetails)
+                // وضعه مباشرة قبل كارت About Me ليظهر أسفل Last message
                 int index = parent.indexOfChild(anchor);
                 parent.addView(tv, Math.max(0, index));
             }
