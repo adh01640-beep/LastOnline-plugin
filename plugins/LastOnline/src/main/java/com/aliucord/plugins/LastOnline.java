@@ -5,12 +5,14 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.aliucord.annotations.AliucordPlugin;
 import com.aliucord.entities.Plugin;
 import com.aliucord.patcher.Hook;
 import com.aliucord.utils.DimenUtils;
+import com.discord.models.user.User;
 import com.discord.stores.StoreStream;
 
 import java.text.SimpleDateFormat;
@@ -26,56 +28,86 @@ public class LastOnline extends Plugin {
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Hook presence updates
-        patcher.patch(
-            StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Map.class),
-            new Hook(param -> {
-                try {
-                    Map<?, ?> updates = (Map<?, ?>) param.args[0];
-                    if (updates == null) return;
+        // 1. تتبع تحديثات الحالات وتخزين الوقت
+        try {
+            patcher.patch(
+                StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Map.class),
+                new Hook(param -> {
+                    try {
+                        Map<?, ?> updates = (Map<?, ?>) param.args[0];
+                        if (updates == null) return;
 
-                    long now = System.currentTimeMillis();
-                    for (Map.Entry<?, ?> entry : updates.entrySet()) {
-                        Object key = entry.getKey();
-                        Object val = entry.getValue();
+                        long now = System.currentTimeMillis();
+                        for (Map.Entry<?, ?> entry : updates.entrySet()) {
+                            Object key = entry.getKey();
+                            Object val = entry.getValue();
 
-                        if (val != null) {
-                            String presenceStr = String.valueOf(val).toLowerCase(Locale.ROOT);
-                            if (presenceStr.contains("online") || presenceStr.contains("idle") || presenceStr.contains("dnd")) {
-                                long targetId = 0L;
-                                if (key instanceof Number) {
-                                    targetId = ((Number) key).longValue();
-                                } else if (key instanceof String) {
-                                    targetId = Long.parseLong((String) key);
-                                }
-
-                                if (targetId != 0L) {
-                                    settings.setLong(String.valueOf(targetId), now);
+                            if (val != null) {
+                                String str = String.valueOf(val).toLowerCase(Locale.ROOT);
+                                if (str.contains("online") || str.contains("idle") || str.contains("dnd")) {
+                                    long targetId = 0L;
+                                    if (key instanceof Number) {
+                                        targetId = ((Number) key).longValue();
+                                    } else if (key instanceof String) {
+                                        targetId = Long.parseLong((String) key);
+                                    }
+                                    if (targetId != 0L) {
+                                        settings.setLong(String.valueOf(targetId), now);
+                                    }
                                 }
                             }
                         }
-                    }
-                } catch (Throwable ignored) {}
-            })
-        );
+                    } catch (Throwable ignored) {}
+                })
+            );
+        } catch (Throwable ignored) {}
 
-        // 2. Patch Profile About Me UI
-        patcher.patch(
-            "com.discord.widgets.user.profile.UserProfileHeaderView",
-            "updateBio",
-            new Class<?>[]{ CharSequence.class, long.class },
-            new Hook(param -> {
-                View headerView = (View) param.thisObject;
-                long userId = (long) param.args[1];
-                headerView.post(() -> renderLastOnline(headerView, userId));
-            })
-        );
+        // 2. ربط فتح البروفايل عبر WidgetUserProfile (الأكثر توافقاً)
+        try {
+            patcher.patch(
+                "com.discord.widgets.user.profile.WidgetUserProfileHeader",
+                "configureUI",
+                new Class<?>[]{
+                    Class.forName("com.discord.widgets.user.profile.UserProfileHeaderViewModel$ViewState")
+                },
+                new Hook(param -> {
+                    try {
+                        View headerView = (View) param.thisObject;
+                        Object viewState = param.args[0];
+                        if (viewState == null) return;
+
+                        // جلب User من الـ ViewState
+                        User user = (User) viewState.getClass().getMethod("getUser").invoke(viewState);
+                        if (user != null) {
+                            long userId = user.getId();
+                            headerView.post(() -> injectLastOnlineView(headerView, userId));
+                        }
+                    } catch (Throwable ignored) {}
+                })
+            );
+        } catch (Throwable ignored) {}
+
+        // 3. Fallback للربط مع UserProfileHeaderView
+        try {
+            patcher.patch(
+                "com.discord.widgets.user.profile.UserProfileHeaderView",
+                "updateBio",
+                new Class<?>[]{ CharSequence.class, long.class },
+                new Hook(param -> {
+                    try {
+                        View headerView = (View) param.thisObject;
+                        long userId = (long) param.args[1];
+                        headerView.post(() -> injectLastOnlineView(headerView, userId));
+                    } catch (Throwable ignored) {}
+                })
+            );
+        } catch (Throwable ignored) {}
     }
 
-    private void renderLastOnline(View headerView, long userId) {
+    private void injectLastOnlineView(View rootView, long userId) {
         try {
-            Context ctx = headerView.getContext();
-            TextView lastOnlineTv = headerView.findViewById(LAST_ONLINE_VIEW_ID);
+            Context ctx = rootView.getContext();
+            TextView lastOnlineTv = rootView.findViewById(LAST_ONLINE_VIEW_ID);
 
             long lastSeen = settings.getLong(String.valueOf(userId), 0L);
             String displayText;
@@ -88,27 +120,29 @@ public class LastOnline extends Plugin {
                     displayText = "LastOnline: " + dateFormat.format(new Date(lastSeen));
                 }
             } else {
-                displayText = "LastOnline: Unknown (Not recorded yet)";
+                displayText = "LastOnline: Unknown (Waiting for activity)";
             }
 
             if (lastOnlineTv == null) {
                 lastOnlineTv = new TextView(ctx);
                 lastOnlineTv.setId(LAST_ONLINE_VIEW_ID);
-                lastOnlineTv.setTextSize(12f);
+                lastOnlineTv.setTextSize(13f);
                 lastOnlineTv.setTypeface(Typeface.DEFAULT_BOLD);
                 lastOnlineTv.setTextColor(Color.parseColor("#B9BBBE"));
 
-                int pad = DimenUtils.dpToPx(4);
-                lastOnlineTv.setPadding(0, pad, 0, pad);
+                int pad = DimenUtils.dpToPx(6);
+                lastOnlineTv.setPadding(pad, pad, pad, pad);
 
-                int bioResId = ctx.getResources().getIdentifier("user_profile_header_bio", "id", ctx.getPackageName());
-                View bioView = headerView.findViewById(bioResId);
+                // محاولة إيجاد حاوية البايو أو إضافتها لأسفل الواجهة
+                int bioId = ctx.getResources().getIdentifier("user_profile_header_bio", "id", ctx.getPackageName());
+                View bioView = (bioId != 0) ? rootView.findViewById(bioId) : null;
 
                 if (bioView != null && bioView.getParent() instanceof ViewGroup) {
                     ViewGroup parent = (ViewGroup) bioView.getParent();
-                    parent.addView(lastOnlineTv, parent.indexOfChild(bioView) + 1);
-                } else if (headerView instanceof ViewGroup) {
-                    ((ViewGroup) headerView).addView(lastOnlineTv);
+                    int index = parent.indexOfChild(bioView);
+                    parent.addView(lastOnlineTv, index + 1);
+                } else if (rootView instanceof ViewGroup) {
+                    ((ViewGroup) rootView).addView(lastOnlineTv);
                 }
             }
 
