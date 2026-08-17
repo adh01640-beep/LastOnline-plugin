@@ -20,16 +20,17 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @AliucordPlugin
 public class LastOnline extends Plugin {
 
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yy, HH:mm:ss", Locale.getDefault());
-    private static final int VIEW_ID = 0x7f098855;
+    private static final String LAST_ONLINE_TAG = "BETTER_USER_DETAILS_LAST_ONLINE";
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Hook Gateway presence updates
+        // 1. Gateway presence updates tracker
         try {
             for (Method m : StoreStream.getPresences().getClass().getDeclaredMethods()) {
                 if (m.getName().equals("handlePresenceUpdate") || m.getName().equals("onPresencesLoaded")) {
@@ -37,7 +38,7 @@ public class LastOnline extends Plugin {
                     patcher.patch(m, new Hook(param -> {
                         try {
                             if (param.args != null && param.args.length > 0 && param.args[0] != null) {
-                                savePresenceUpdates(param.args[0]);
+                                processPresences(param.args[0]);
                             }
                         } catch (Throwable ignored) {}
                     }));
@@ -45,29 +46,45 @@ public class LastOnline extends Plugin {
             }
         } catch (Throwable ignored) {}
 
-        // 2. Direct Hook on WidgetUserProfileSheet onViewBound (Root container)
-        try {
-            ClassLoader cl = context.getClassLoader();
-            Class<?> sheetClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
+        // 2. Exact BetterUserDetails hook: WidgetUserSheet.configureNote
+        ClassLoader cl = context.getClassLoader();
+        Class<?> userSheetClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
+        Class<?> loadedClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
 
-            for (Method m : sheetClass.getDeclaredMethods()) {
-                if (m.getName().equals("onViewBound") || m.getName().equals("configureUI") || m.getName().equals("configureNote")) {
-                    m.setAccessible(true);
-                    patcher.patch(m, new Hook(param -> {
-                        try {
-                            Object target = param.thisObject;
-                            View sheetRoot = (View) ReflectUtils.invokeMethod(target, "requireView");
-                            if (sheetRoot != null) {
-                                sheetRoot.post(() -> attachLastOnline(target, sheetRoot));
-                            }
-                        } catch (Throwable ignored) {}
-                    }));
+        Method configureNoteMethod = userSheetClass.getDeclaredMethod("configureNote", loadedClass);
+        configureNoteMethod.setAccessible(true);
+
+        patcher.patch(configureNoteMethod, new Hook(param -> {
+            try {
+                Object sheet = param.thisObject;
+                Object loadedState = param.args[0];
+                if (sheet == null || loadedState == null) return;
+
+                // Extract User
+                User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
+                if (user == null) {
+                    user = (User) ReflectUtils.getField(loadedState, "user");
                 }
-            }
-        } catch (Throwable ignored) {}
+                if (user == null) return;
+
+                long userId = user.getId();
+
+                // Access WidgetUserSheetBinding
+                Object binding = ReflectUtils.getField(sheet, "binding");
+                if (binding == null) return;
+
+                View aboutMeCard = (View) ReflectUtils.getField(binding, "aboutMeCard");
+                if (aboutMeCard == null || !(aboutMeCard.getParent() instanceof ViewGroup)) return;
+
+                ViewGroup contentContainer = (ViewGroup) aboutMeCard.getParent();
+
+                // Render in UI pass
+                renderEntry(contentContainer, aboutMeCard, userId);
+            } catch (Throwable ignored) {}
+        }));
     }
 
-    private void savePresenceUpdates(Object data) {
+    private void processPresences(Object data) {
         try {
             if (data instanceof Map) {
                 Map<?, ?> map = (Map<?, ?>) data;
@@ -78,7 +95,7 @@ public class LastOnline extends Plugin {
                     } else if (entry.getKey() instanceof String) {
                         try { uid = Long.parseLong((String) entry.getKey()); } catch (Throwable ignored) {}
                     }
-                    recordTime(uid, entry.getValue());
+                    saveIfActive(uid, entry.getValue());
                 }
             } else {
                 long uid = 0L;
@@ -95,13 +112,13 @@ public class LastOnline extends Plugin {
                 }
 
                 if (uid != 0L) {
-                    recordTime(uid, data);
+                    saveIfActive(uid, data);
                 }
             }
         } catch (Throwable ignored) {}
     }
 
-    private void recordTime(long userId, Object presenceObj) {
+    private void saveIfActive(long userId, Object presenceObj) {
         if (presenceObj == null || userId == 0L) return;
         String status = String.valueOf(presenceObj).toLowerCase(Locale.ROOT);
         if (status.contains("online") || status.contains("idle") || status.contains("dnd")) {
@@ -109,38 +126,31 @@ public class LastOnline extends Plugin {
         }
     }
 
-    private void attachLastOnline(Object sheet, View sheetRoot) {
+    private String toRelativeTime(long timestamp) {
+        long diff = System.currentTimeMillis() - timestamp;
+        if (diff < 60000) {
+            return "Active Now";
+        }
+        long days = TimeUnit.MILLISECONDS.toDays(diff);
+        if (days == 0) {
+            return dateFormat.format(new Date(timestamp)) + " (Today)";
+        } else if (days == 1) {
+            return dateFormat.format(new Date(timestamp)) + " (Yesterday)";
+        } else {
+            return dateFormat.format(new Date(timestamp)) + " (" + days + " days ago)";
+        }
+    }
+
+    private void renderEntry(ViewGroup contentContainer, View aboutMeCard, long userId) {
         try {
-            Context ctx = sheetRoot.getContext();
+            Context ctx = contentContainer.getContext();
 
-            // Extract User ID
-            long userId = 0L;
-            try {
-                Object binding = ReflectUtils.getField(sheet, "binding");
-                Object viewModel = ReflectUtils.getField(sheet, "viewModel");
-                Object viewState = ReflectUtils.invokeMethod(viewModel, "getViewState");
-                User user = (User) ReflectUtils.invokeMethod(viewState, "getUser");
-                if (user != null) userId = user.getId();
-            } catch (Throwable ignored) {}
-
-            if (userId == 0L) {
-                try {
-                    android.os.Bundle args = (android.os.Bundle) ReflectUtils.invokeMethod(sheet, "getArguments");
-                    if (args != null) {
-                        if (args.containsKey("USER_ID")) userId = args.getLong("USER_ID");
-                        else if (args.containsKey("user_id")) userId = args.getLong("user_id");
-                    }
-                } catch (Throwable ignored) {}
-            }
-
-            if (userId == 0L) return;
-
-            // Find current presence or last seen
+            // 1. Check live memory cache
             long lastSeen = settings.getLong(String.valueOf(userId), 0L);
             try {
-                Map<?, ?> activeMap = (Map<?, ?>) ReflectUtils.invokeMethod(StoreStream.getPresences(), "getPresences");
-                if (activeMap != null && activeMap.containsKey(userId)) {
-                    Object p = activeMap.get(userId);
+                Map<?, ?> liveMap = (Map<?, ?>) ReflectUtils.invokeMethod(StoreStream.getPresences(), "getPresences");
+                if (liveMap != null && liveMap.containsKey(userId)) {
+                    Object p = liveMap.get(userId);
                     String str = String.valueOf(p).toLowerCase(Locale.ROOT);
                     if (str.contains("online") || str.contains("idle") || str.contains("dnd")) {
                         lastSeen = System.currentTimeMillis();
@@ -149,65 +159,60 @@ public class LastOnline extends Plugin {
                 }
             } catch (Throwable ignored) {}
 
-            String text;
+            String formattedText;
             if (lastSeen > 0) {
-                long diff = System.currentTimeMillis() - lastSeen;
-                long days = diff / (1000L * 60 * 60 * 24);
-
-                if (diff < 60000) {
-                    text = "Last online: Active Now";
-                } else if (days == 0) {
-                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
-                } else {
-                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
-                }
+                formattedText = "Last online: " + toRelativeTime(lastSeen);
             } else {
-                text = "Last online: Unknown (No activity logged)";
+                formattedText = "Last online: Unknown";
             }
 
-            // Find insertion container: search for about_me_card or user_sheet_content
-            int aboutMeId = ctx.getResources().getIdentifier("about_me_card", "id", ctx.getPackageName());
-            int contentId = ctx.getResources().getIdentifier("user_sheet_content", "id", ctx.getPackageName());
-
-            View aboutMeCard = (aboutMeId != 0) ? sheetRoot.findViewById(aboutMeId) : null;
-            ViewGroup container = null;
-
-            if (contentId != 0) {
-                View cv = sheetRoot.findViewById(contentId);
-                if (cv instanceof ViewGroup) container = (ViewGroup) cv;
+            // 2. Identify BetterUserDetails LinearLayout container
+            LinearLayout budContainer = null;
+            for (int i = 0; i < contentContainer.getChildCount(); i++) {
+                View child = contentContainer.getChildAt(i);
+                if (child instanceof LinearLayout && child != aboutMeCard) {
+                    budContainer = (LinearLayout) child;
+                    break;
+                }
             }
 
-            if (container == null && aboutMeCard != null && aboutMeCard.getParent() instanceof ViewGroup) {
-                container = (ViewGroup) aboutMeCard.getParent();
-            }
+            ViewGroup targetParent = (budContainer != null) ? budContainer : contentContainer;
+            TextView tv = targetParent.findViewWithTag(LAST_ONLINE_TAG);
 
-            if (container == null) return;
-
-            TextView tv = container.findViewById(VIEW_ID);
             if (tv == null) {
                 tv = new TextView(ctx);
-                tv.setId(VIEW_ID);
+                tv.setTag(LAST_ONLINE_TAG);
                 tv.setTextSize(12f);
                 tv.setTextColor(Color.parseColor("#B9BBBE"));
 
-                int padH = DimenUtils.dpToPx(16);
-                int padV = DimenUtils.dpToPx(2);
-                tv.setPadding(padH, padV, padH, padV);
-
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                );
-                tv.setLayoutParams(lp);
-
-                if (aboutMeCard != null && container.indexOfChild(aboutMeCard) != -1) {
-                    container.addView(tv, container.indexOfChild(aboutMeCard));
+                if (targetParent == budContainer) {
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    );
+                    lp.topMargin = DimenUtils.dpToPx(1);
+                    tv.setLayoutParams(lp);
+                    targetParent.addView(tv);
                 } else {
-                    container.addView(tv);
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    );
+                    int padStart = DimenUtils.dpToPx(16);
+                    int padBottom = DimenUtils.dpToPx(2);
+                    tv.setPadding(padStart, 0, padStart, padBottom);
+                    tv.setLayoutParams(lp);
+
+                    int index = contentContainer.indexOfChild(aboutMeCard);
+                    if (index >= 0) {
+                        contentContainer.addView(tv, index);
+                    } else {
+                        contentContainer.addView(tv);
+                    }
                 }
             }
 
-            tv.setText(text);
+            tv.setText(formattedText);
         } catch (Throwable ignored) {}
     }
 
