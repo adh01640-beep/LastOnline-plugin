@@ -6,8 +6,7 @@ plugins {
 
 aliucord {
     author("Adham", 0L)
-    description = "Displays the last seen timestamp of a user on their profile."
+    description = "Shows last online presence timestamp."
     version = "1.0.0"
     deploy.set(true)
 }
-
