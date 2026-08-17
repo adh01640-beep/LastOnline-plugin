@@ -15,6 +15,6 @@ android {
 aliucord {
     author("Adham", 0L)
     description = "Shows last online presence timestamp."
-    version = "1.0.0"
+    version = "1.0.1"
     deploy.set(true)
 }
