@@ -9,77 +9,86 @@ import android.widget.TextView;
 
 import com.aliucord.annotations.AliucordPlugin;
 import com.aliucord.entities.Plugin;
-import com.aliucord.patcher.Hook;
 import com.aliucord.utils.DimenUtils;
 import com.aliucord.utils.ReflectUtils;
 import com.discord.models.user.User;
 import com.discord.stores.StoreStream;
 
+import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 import java.util.Map;
 
+import de.robv.android.xposed.XC_MethodHook;
+
 @AliucordPlugin
 public class LastOnline extends Plugin {
 
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yy, HH:mm:ss", Locale.getDefault());
-    private final int lastOnlineViewId = View.generateViewId();
+    private static final String LAST_ONLINE_TAG = "ALIUCORD_LAST_ONLINE_VIEW";
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Presence Listener
+        // 1. Hook Gateway presence updates to track activity in real-time
         try {
-            for (java.lang.reflect.Method method : StoreStream.getPresences().getClass().getDeclaredMethods()) {
-                if (method.getName().equals("handlePresenceUpdate") || method.getName().equals("onPresencesLoaded")) {
-                    patcher.patch(method, new Hook(param -> {
-                        try {
-                            if (param.args != null && param.args.length > 0 && param.args[0] != null) {
-                                processPresences(param.args[0]);
-                            }
-                        } catch (Throwable ignored) {}
-                    }));
+            for (Method m : StoreStream.getPresences().getClass().getDeclaredMethods()) {
+                if (m.getName().equals("handlePresenceUpdate") || m.getName().equals("onPresencesLoaded")) {
+                    m.setAccessible(true);
+                    patcher.patch(m, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.args != null && param.args.length > 0 && param.args[0] != null) {
+                                    processPresenceData(param.args[0]);
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
                 }
             }
         } catch (Throwable ignored) {}
 
-        // 2. Exact BetterUserDetails hook: WidgetUserSheet.configureNote
+        // 2. Hook WidgetUserSheet.configureNote using afterHookedMethod (Exact BetterUserDetails lifecycle)
         ClassLoader cl = context.getClassLoader();
         Class<?> userSheetClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
         Class<?> loadedClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
 
-        patcher.patch(
-            userSheetClass.getDeclaredMethod("configureNote", loadedClass),
-            new Hook(param -> {
+        Method configureNoteMethod = userSheetClass.getDeclaredMethod("configureNote", loadedClass);
+        configureNoteMethod.setAccessible(true);
+
+        patcher.patch(configureNoteMethod, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
                 try {
                     Object sheet = param.thisObject;
                     Object loadedState = param.args[0];
                     if (sheet == null || loadedState == null) return;
 
-                    // Extract User
                     User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
+                    if (user == null) {
+                        user = (User) ReflectUtils.getField(loadedState, "user");
+                    }
                     if (user == null) return;
 
                     long userId = user.getId();
 
-                    // Access binding
                     Object binding = ReflectUtils.getField(sheet, "binding");
                     if (binding == null) return;
 
-                    // Access aboutMeCard and its parent container (user_sheet_content)
                     View aboutMeCard = (View) ReflectUtils.getField(binding, "aboutMeCard");
                     if (aboutMeCard == null || !(aboutMeCard.getParent() instanceof ViewGroup)) return;
 
                     ViewGroup parent = (ViewGroup) aboutMeCard.getParent();
 
-                    // Render LastOnline
-                    renderLastOnline(parent, aboutMeCard, userId);
+                    // Render immediately after BetterUserDetails finishes building
+                    parent.post(() -> injectRow(parent, aboutMeCard, userId));
                 } catch (Throwable ignored) {}
-            })
-        );
+            }
+        });
     }
 
-    private void processPresences(Object data) {
+    private void processPresenceData(Object data) {
         try {
             if (data instanceof Map) {
                 Map<?, ?> map = (Map<?, ?>) data;
@@ -90,7 +99,7 @@ public class LastOnline extends Plugin {
                     } else if (entry.getKey() instanceof String) {
                         try { uid = Long.parseLong((String) entry.getKey()); } catch (Throwable ignored) {}
                     }
-                    checkAndStore(uid, entry.getValue());
+                    saveIfOnline(uid, entry.getValue());
                 }
             } else {
                 long uid = 0L;
@@ -107,13 +116,13 @@ public class LastOnline extends Plugin {
                 }
 
                 if (uid != 0L) {
-                    checkAndStore(uid, data);
+                    saveIfOnline(uid, data);
                 }
             }
         } catch (Throwable ignored) {}
     }
 
-    private void checkAndStore(long userId, Object presenceObj) {
+    private void saveIfOnline(long userId, Object presenceObj) {
         if (presenceObj == null || userId == 0L) return;
         String status = String.valueOf(presenceObj).toLowerCase(Locale.ROOT);
         if (status.contains("online") || status.contains("idle") || status.contains("dnd")) {
@@ -121,61 +130,87 @@ public class LastOnline extends Plugin {
         }
     }
 
-    private void renderLastOnline(ViewGroup parent, View aboutMeCard, long userId) {
+    private void injectRow(ViewGroup parent, View aboutMeCard, long userId) {
         try {
             Context ctx = parent.getContext();
 
-            // Find or create the view
-            TextView tv = parent.findViewById(lastOnlineViewId);
-
+            // 1. Check live active presence from memory store
             long lastSeen = settings.getLong(String.valueOf(userId), 0L);
-            String text;
+            try {
+                Map<?, ?> map = (Map<?, ?>) ReflectUtils.invokeMethod(StoreStream.getPresences(), "getPresences");
+                if (map != null && map.containsKey(userId)) {
+                    Object p = map.get(userId);
+                    String str = String.valueOf(p).toLowerCase(Locale.ROOT);
+                    if (str.contains("online") || str.contains("idle") || str.contains("dnd")) {
+                        lastSeen = System.currentTimeMillis();
+                        settings.setLong(String.valueOf(userId), lastSeen);
+                    }
+                }
+            } catch (Throwable ignored) {}
 
+            // 2. Format display text
+            String displayText;
             if (lastSeen > 0) {
                 long diff = System.currentTimeMillis() - lastSeen;
-                long days = diff / (1000 * 60 * 60 * 24);
+                long days = diff / (1000L * 60 * 60 * 24);
 
                 if (diff < 60000) {
-                    text = "Last online: Active Now";
+                    displayText = "Last online: Active Now";
                 } else if (days == 0) {
-                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
+                    displayText = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
                 } else {
-                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
+                    displayText = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
                 }
             } else {
-                text = "Last online: Unknown (No data recorded)";
+                displayText = "Last online: Unknown (No prior activity recorded)";
+            }
+
+            // 3. Locate BetterUserDetails container (it inserts a LinearLayout right above aboutMeCard)
+            ViewGroup targetContainer = null;
+            for (int i = 0; i < parent.getChildCount(); i++) {
+                View child = parent.getChildAt(i);
+                if (child instanceof LinearLayout && child != aboutMeCard) {
+                    targetContainer = (LinearLayout) child;
+                    break;
+                }
+            }
+
+            if (targetContainer == null) {
+                targetContainer = parent;
+            }
+
+            // 4. Find or create the TextView
+            TextView tv = targetContainer.findViewWithTag(LAST_ONLINE_TAG);
+            if (tv == null) {
+                tv = parent.findViewWithTag(LAST_ONLINE_TAG);
+                if (tv != null && tv.getParent() instanceof ViewGroup) {
+                    ((ViewGroup) tv.getParent()).removeView(tv);
+                    tv = null;
+                }
             }
 
             if (tv == null) {
                 tv = new TextView(ctx);
-                tv.setId(lastOnlineViewId);
+                tv.setTag(LAST_ONLINE_TAG);
                 tv.setTextSize(12f);
                 tv.setTextColor(Color.parseColor("#B9BBBE"));
 
-                // Check if BetterUserDetails created its container
-                LinearLayout betterUserDetailsContainer = null;
-                for (int i = 0; i < parent.getChildCount(); i++) {
-                    View child = parent.getChildAt(i);
-                    if (child instanceof LinearLayout && child != aboutMeCard) {
-                        betterUserDetailsContainer = (LinearLayout) child;
-                        break;
-                    }
-                }
-
-                if (betterUserDetailsContainer != null) {
-                    // Append inside BetterUserDetails container as the last row
+                if (targetContainer instanceof LinearLayout && targetContainer != parent) {
                     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT
                     );
-                    lp.topMargin = DimenUtils.dpToPx(2);
                     tv.setLayoutParams(lp);
-                    betterUserDetailsContainer.addView(tv);
+                    targetContainer.addView(tv);
                 } else {
-                    // Standalone placement right before aboutMeCard
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    );
                     int padH = DimenUtils.dpToPx(16);
                     int padV = DimenUtils.dpToPx(2);
                     tv.setPadding(padH, padV, padH, padV);
+                    tv.setLayoutParams(lp);
 
                     int index = parent.indexOfChild(aboutMeCard);
                     if (index >= 0) {
@@ -186,7 +221,7 @@ public class LastOnline extends Plugin {
                 }
             }
 
-            tv.setText(text);
+            tv.setText(displayText);
         } catch (Throwable ignored) {}
     }
 
