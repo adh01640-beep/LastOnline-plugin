@@ -24,41 +24,61 @@ import java.util.Map;
 public class LastOnline extends Plugin {
 
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yy, HH:mm:ss", Locale.getDefault());
-    private static final int VIEW_ID = 0x7f090099;
+    private static final int VIEW_ID = View.generateViewId();
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Hook StoreUserPresence to record real-time gateway presence updates
+        // 1. Presence Tracker
         try {
             for (java.lang.reflect.Method m : StoreStream.getPresences().getClass().getDeclaredMethods()) {
                 if (m.getName().equals("handlePresenceUpdate") || m.getName().equals("onPresencesLoaded")) {
                     patcher.patch(m, new Hook(param -> {
-                        if (param.args.length > 0 && param.args[0] != null) {
-                            processPresenceData(param.args[0]);
+                        if (param.args != null && param.args.length > 0 && param.args[0] != null) {
+                            processPresence(param.args[0]);
                         }
                     }));
                 }
             }
         } catch (Throwable ignored) {}
 
-        // 2. Exact hook used to render profile details in the user sheet
+        // 2. Exact BetterUserDetails Hook
         ClassLoader classLoader = context.getClassLoader();
         Class<?> userSheetClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
+        Class<?> loadedClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
 
+        // Hook configureUI & configureNote
         for (java.lang.reflect.Method method : userSheetClass.getDeclaredMethods()) {
-            if (method.getName().equals("onViewBound")) {
-                patcher.patch(method, new Hook(param -> {
-                    try {
-                        Object sheet = param.thisObject;
-                        View rootView = (View) param.args[0];
-                        hookSheetBinding(sheet, rootView);
-                    } catch (Throwable ignored) {}
-                }));
+            if (method.getName().equals("configureUI") || method.getName().equals("configureNote")) {
+                Class<?>[] params = method.getParameterTypes();
+                if (params.length == 1 && params[0].isAssignableFrom(loadedClass)) {
+                    patcher.patch(method, new Hook(param -> {
+                        try {
+                            Object sheet = param.thisObject;
+                            Object loadedState = param.args[0];
+                            if (sheet == null || loadedState == null) return;
+
+                            User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
+                            if (user == null) return;
+
+                            long userId = user.getId();
+
+                            // Retrieve Discord ViewBinding
+                            Object binding = ReflectUtils.getField(sheet, "binding");
+                            if (binding == null) return;
+
+                            View aboutMeCard = (View) ReflectUtils.getField(binding, "aboutMeCard");
+                            if (aboutMeCard == null || !(aboutMeCard.getParent() instanceof ViewGroup)) return;
+
+                            ViewGroup parentContainer = (ViewGroup) aboutMeCard.getParent();
+                            parentContainer.post(() -> renderRow(parentContainer, aboutMeCard, userId));
+                        } catch (Throwable ignored) {}
+                    }));
+                }
             }
         }
     }
 
-    private void processPresenceData(Object data) {
+    private void processPresence(Object data) {
         try {
             if (data instanceof Map) {
                 Map<?, ?> map = (Map<?, ?>) data;
@@ -100,91 +120,65 @@ public class LastOnline extends Plugin {
         }
     }
 
-    private void hookSheetBinding(Object sheet, View rootView) {
-        rootView.post(() -> {
-            try {
-                // Retrieve the user ID currently open in the sheet
-                long userId = 0L;
-                try {
-                    Object viewModel = ReflectUtils.getField(sheet, "viewModel");
-                    Object viewState = ReflectUtils.invokeMethod(viewModel, "getViewState");
-                    Object user = ReflectUtils.invokeMethod(viewState, "getUser");
-                    if (user instanceof User) userId = ((User) user).getId();
-                } catch (Throwable ignored) {}
+    private void renderRow(ViewGroup parentContainer, View aboutMeCard, long userId) {
+        try {
+            Context ctx = parentContainer.getContext();
+            TextView tv = parentContainer.findViewById(VIEW_ID);
 
-                if (userId == 0L) {
-                    android.os.Bundle args = (android.os.Bundle) ReflectUtils.invokeMethod(sheet, "getArguments");
-                    if (args != null) {
-                        if (args.containsKey("USER_ID")) userId = args.getLong("USER_ID");
-                        else if (args.containsKey("user_id")) userId = args.getLong("user_id");
+            long lastSeen = settings.getLong(String.valueOf(userId), 0L);
+            String text;
+
+            if (lastSeen > 0) {
+                long diff = System.currentTimeMillis() - lastSeen;
+                long days = diff / (1000 * 60 * 60 * 24);
+
+                if (diff < 60000) {
+                    text = "Last online: Active Now";
+                } else if (days == 0) {
+                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
+                } else {
+                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
+                }
+            } else {
+                text = "Last online: Unknown (No data recorded)";
+            }
+
+            if (tv == null) {
+                tv = new TextView(ctx);
+                tv.setId(VIEW_ID);
+                tv.setTextSize(12f);
+                tv.setTextColor(Color.parseColor("#B9BBBE"));
+
+                // Check if BetterUserDetails LinearLayout container exists
+                ViewGroup targetParent = parentContainer;
+                int targetIndex = parentContainer.indexOfChild(aboutMeCard);
+
+                // Look for BetterUserDetails container (it inserts a LinearLayout right before aboutMeCard)
+                for (int i = 0; i < parentContainer.getChildCount(); i++) {
+                    View child = parentContainer.getChildAt(i);
+                    if (child instanceof LinearLayout && child != aboutMeCard) {
+                        targetParent = (LinearLayout) child;
+                        targetIndex = -1; // Append inside BetterUserDetails container
+                        break;
                     }
                 }
 
-                if (userId == 0L) return;
-
-                // Find user_sheet_content and about_me_card directly in the view tree
-                Context ctx = rootView.getContext();
-                int contentId = ctx.getResources().getIdentifier("user_sheet_content", "id", ctx.getPackageName());
-                int aboutMeId = ctx.getResources().getIdentifier("about_me_card", "id", ctx.getPackageName());
-
-                ViewGroup targetContainer = null;
-                View aboutMeCard = null;
-
-                if (contentId != 0) {
-                    View cv = rootView.findViewById(contentId);
-                    if (cv instanceof ViewGroup) targetContainer = (ViewGroup) cv;
-                }
-
-                if (aboutMeId != 0) {
-                    aboutMeCard = rootView.findViewById(aboutMeId);
-                    if (aboutMeCard != null && targetContainer == null && aboutMeCard.getParent() instanceof ViewGroup) {
-                        targetContainer = (ViewGroup) aboutMeCard.getParent();
-                    }
-                }
-
-                if (targetContainer == null) return;
-
-                TextView tv = targetContainer.findViewById(VIEW_ID);
-
-                long lastSeen = settings.getLong(String.valueOf(userId), 0L);
-                String text;
-
-                if (lastSeen > 0) {
-                    long diff = System.currentTimeMillis() - lastSeen;
-                    long days = diff / (1000 * 60 * 60 * 24);
-
-                    if (diff < 60000) {
-                        text = "Last online: Active Now";
-                    } else if (days == 0) {
-                        text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
+                if (targetParent == parentContainer) {
+                    int padStart = DimenUtils.dpToPx(16);
+                    int padBottom = DimenUtils.dpToPx(2);
+                    tv.setPadding(padStart, 0, padStart, padBottom);
+                    if (targetIndex >= 0) {
+                        parentContainer.addView(tv, targetIndex);
                     } else {
-                        text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
+                        parentContainer.addView(tv);
                     }
                 } else {
-                    text = "Last online: Unknown (No data recorded)";
+                    targetParent.addView(tv);
                 }
+            }
 
-                if (tv == null) {
-                    tv = new TextView(ctx);
-                    tv.setId(VIEW_ID);
-                    tv.setTextSize(12f);
-                    tv.setTextColor(Color.parseColor("#B9BBBE"));
-
-                    int padH = DimenUtils.dpToPx(16);
-                    int padV = DimenUtils.dpToPx(2);
-                    tv.setPadding(padH, padV, padH, padV);
-
-                    if (aboutMeCard != null && targetContainer.indexOfChild(aboutMeCard) != -1) {
-                        int index = targetContainer.indexOfChild(aboutMeCard);
-                        targetContainer.addView(tv, index);
-                    } else {
-                        targetContainer.addView(tv);
-                    }
-                }
-
-                tv.setText(text);
-            } catch (Throwable ignored) {}
-        });
+            tv.setText(text);
+        } catch (Throwable ignored) {}
     }
 
     @Override
