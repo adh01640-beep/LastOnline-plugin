@@ -12,6 +12,7 @@ import com.aliucord.entities.Plugin;
 import com.aliucord.patcher.Hook;
 import com.aliucord.utils.DimenUtils;
 import com.aliucord.utils.ReflectUtils;
+import com.discord.models.presence.Presence;
 import com.discord.models.user.User;
 import com.discord.stores.StoreStream;
 
@@ -24,101 +25,89 @@ import java.util.Map;
 public class LastOnline extends Plugin {
 
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yy, HH:mm:ss", Locale.getDefault());
-    private static final int LAST_ONLINE_VIEW_ID = View.generateViewId();
+    private static final int VIEW_ID = 0x7f090099;
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. تتبع الـ Presence لتسجيل التوقيت
+        // 1. Hook على StoreUserPresence لتسجيل الحالات الحية
         try {
             patcher.patch(
-                StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Map.class),
+                StoreStream.getPresences().getClass().getDeclaredMethod("onPresencesLoaded", Map.class),
+                new Hook(param -> recordPresences(param.args[0]))
+            );
+        } catch (Throwable ignored) {}
+
+        try {
+            patcher.patch(
+                StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Presence.class),
                 new Hook(param -> {
-                    try {
-                        Map<?, ?> updates = (Map<?, ?>) param.args[0];
-                        if (updates == null) return;
-
-                        long now = System.currentTimeMillis();
-                        for (Map.Entry<?, ?> entry : updates.entrySet()) {
-                            Object key = entry.getKey();
-                            Object val = entry.getValue();
-
-                            if (val != null) {
-                                String str = String.valueOf(val).toLowerCase(Locale.ROOT);
-                                if (str.contains("online") || str.contains("idle") || str.contains("dnd")) {
-                                    long targetId = 0L;
-                                    if (key instanceof Number) {
-                                        targetId = ((Number) key).longValue();
-                                    } else if (key instanceof String) {
-                                        targetId = Long.parseLong((String) key);
-                                    }
-                                    if (targetId != 0L) {
-                                        settings.setLong(String.valueOf(targetId), now);
-                                    }
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
+                    if (param.args[0] instanceof Presence) {
+                        Presence p = (Presence) param.args[0];
+                        checkAndSave(p.getUserId(), p);
+                    }
                 })
             );
         } catch (Throwable ignored) {}
 
-        // 2. نفس Hook إضافة BetterUserDetails لوضع السطر أسفله مباشرة
-        try {
-            ClassLoader classLoader = context.getClassLoader();
-            Class<?> userSheetClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
-            Class<?> loadedStateClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
+        // 2. نفس Hook إضافة BetterUserDetails بالضبط (WidgetUserSheet.configureNote)
+        ClassLoader classLoader = context.getClassLoader();
+        Class<?> userSheetClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
+        Class<?> loadedClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
 
-            patcher.patch(
-                userSheetClass.getDeclaredMethod("configureNote", loadedStateClass),
-                new Hook(param -> {
-                    try {
-                        Object sheet = param.thisObject;
-                        Object loadedState = param.args[0];
-                        if (loadedState == null) return;
+        patcher.patch(
+            userSheetClass.getDeclaredMethod("configureNote", loadedClass),
+            new Hook(param -> {
+                try {
+                    Object sheet = param.thisObject;
+                    Object loadedState = param.args[0];
+                    if (loadedState == null) return;
 
-                        // استخراج الـ User من الـ Loaded State
-                        User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
-                        if (user == null) return;
+                    User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
+                    if (user == null) return;
 
-                        long userId = user.getId();
-                        View sheetView = (View) ReflectUtils.invokeMethod(sheet, "requireView");
+                    long userId = user.getId();
 
-                        if (sheetView != null) {
-                            sheetView.post(() -> addLastOnlineView(sheetView, userId));
-                        }
-                    } catch (Throwable ignored) {}
-                })
-            );
-        } catch (Throwable ignored) {}
+                    // الوصول للـ View عبر Binding
+                    Object binding = ReflectUtils.getField(sheet, "binding");
+                    if (binding == null) return;
+
+                    View aboutMeCard = (View) ReflectUtils.getField(binding, "aboutMeCard");
+                    if (aboutMeCard == null || !(aboutMeCard.getParent() instanceof ViewGroup)) return;
+
+                    ViewGroup parent = (ViewGroup) aboutMeCard.getParent();
+                    parent.post(() -> injectRow(parent, aboutMeCard, userId));
+                } catch (Throwable ignored) {}
+            })
+        );
     }
 
-    private void addLastOnlineView(View sheetView, long userId) {
+    private void recordPresences(Object mapObj) {
+        if (!(mapObj instanceof Map)) return;
+        Map<?, ?> map = (Map<?, ?>) mapObj;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (entry.getValue() instanceof Presence) {
+                long uid = 0L;
+                if (entry.getKey() instanceof Number) uid = ((Number) entry.getKey()).longValue();
+                checkAndSave(uid, (Presence) entry.getValue());
+            }
+        }
+    }
+
+    private void checkAndSave(long userId, Presence presence) {
+        if (presence == null) return;
+        String status = String.valueOf(presence.getStatus()).toLowerCase(Locale.ROOT);
+        if (status.contains("online") || status.contains("idle") || status.contains("dnd")) {
+            long now = System.currentTimeMillis();
+            if (userId != 0L) {
+                settings.setLong(String.valueOf(userId), now);
+            }
+        }
+    }
+
+    private void injectRow(ViewGroup parent, View anchor, long userId) {
         try {
-            Context ctx = sheetView.getContext();
-
-            // العثور على الحاوية العلوية أسفل اسم المستخدم
-            int aboutMeId = ctx.getResources().getIdentifier("about_me_card", "id", ctx.getPackageName());
-            int contentId = ctx.getResources().getIdentifier("user_sheet_content", "id", ctx.getPackageName());
-
-            View targetAnchor = (aboutMeId != 0) ? sheetView.findViewById(aboutMeId) : null;
-            ViewGroup container = null;
-
-            if (targetAnchor != null && targetAnchor.getParent() instanceof ViewGroup) {
-                container = (ViewGroup) targetAnchor.getParent();
-            } else if (contentId != 0) {
-                View contentView = sheetView.findViewById(contentId);
-                if (contentView instanceof ViewGroup) {
-                    container = (ViewGroup) contentView;
-                }
-            }
-
-            if (container == null && sheetView instanceof ViewGroup) {
-                container = (ViewGroup) sheetView;
-            }
-
-            if (container == null) return;
-
-            TextView tv = sheetView.findViewById(LAST_ONLINE_VIEW_ID);
+            Context ctx = parent.getContext();
+            TextView tv = parent.findViewById(VIEW_ID);
 
             long lastSeen = settings.getLong(String.valueOf(userId), 0L);
             String text;
@@ -140,21 +129,17 @@ public class LastOnline extends Plugin {
 
             if (tv == null) {
                 tv = new TextView(ctx);
-                tv.setId(LAST_ONLINE_VIEW_ID);
+                tv.setId(VIEW_ID);
                 tv.setTextSize(12f);
                 tv.setTextColor(Color.parseColor("#B9BBBE"));
 
                 int padStart = DimenUtils.dpToPx(16);
-                int padBottom = DimenUtils.dpToPx(4);
+                int padBottom = DimenUtils.dpToPx(2);
                 tv.setPadding(padStart, 0, padStart, padBottom);
 
-                // إضافته في آخر عنصر قبل كارت About Me ليظهر أسفل Last message
-                if (targetAnchor != null) {
-                    int index = container.indexOfChild(targetAnchor);
-                    container.addView(tv, Math.max(0, index));
-                } else {
-                    container.addView(tv);
-                }
+                // وضعه مباشرة قبل كارت About Me (نفس مكان تفاصيل BetterUserDetails)
+                int index = parent.indexOfChild(anchor);
+                parent.addView(tv, Math.max(0, index));
             }
 
             tv.setText(text);
