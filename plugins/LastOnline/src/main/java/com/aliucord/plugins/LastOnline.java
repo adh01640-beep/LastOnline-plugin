@@ -2,7 +2,6 @@ package com.aliucord.plugins;
 
 import android.content.Context;
 import android.graphics.Color;
-import android.graphics.Typeface;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.LinearLayout;
@@ -12,6 +11,7 @@ import com.aliucord.annotations.AliucordPlugin;
 import com.aliucord.entities.Plugin;
 import com.aliucord.patcher.Hook;
 import com.aliucord.utils.DimenUtils;
+import com.aliucord.utils.ReflectUtils;
 import com.discord.models.user.User;
 import com.discord.stores.StoreStream;
 
@@ -23,12 +23,12 @@ import java.util.Map;
 @AliucordPlugin
 public class LastOnline extends Plugin {
 
-    private final SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yy HH:mm:ss", Locale.getDefault());
+    private final SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yy, HH:mm:ss", Locale.getDefault());
     private static final int LAST_ONLINE_VIEW_ID = View.generateViewId();
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. تتبع تحديثات الحالات وتخزين الوقت
+        // 1. تتبع الـ Presence لتسجيل التوقيت
         try {
             patcher.patch(
                 StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Map.class),
@@ -62,91 +62,102 @@ public class LastOnline extends Plugin {
             );
         } catch (Throwable ignored) {}
 
-        // 2. ربط فتح البروفايل عبر WidgetUserProfile (الأكثر توافقاً)
+        // 2. نفس Hook إضافة BetterUserDetails لوضع السطر أسفله مباشرة
         try {
+            ClassLoader classLoader = context.getClassLoader();
+            Class<?> userSheetClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
+            Class<?> loadedStateClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
+
             patcher.patch(
-                "com.discord.widgets.user.profile.WidgetUserProfileHeader",
-                "configureUI",
-                new Class<?>[]{
-                    Class.forName("com.discord.widgets.user.profile.UserProfileHeaderViewModel$ViewState")
-                },
+                userSheetClass.getDeclaredMethod("configureNote", loadedStateClass),
                 new Hook(param -> {
                     try {
-                        View headerView = (View) param.thisObject;
-                        Object viewState = param.args[0];
-                        if (viewState == null) return;
+                        Object sheet = param.thisObject;
+                        Object loadedState = param.args[0];
+                        if (loadedState == null) return;
 
-                        // جلب User من الـ ViewState
-                        User user = (User) viewState.getClass().getMethod("getUser").invoke(viewState);
-                        if (user != null) {
-                            long userId = user.getId();
-                            headerView.post(() -> injectLastOnlineView(headerView, userId));
+                        // استخراج الـ User من الـ Loaded State
+                        User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
+                        if (user == null) return;
+
+                        long userId = user.getId();
+                        View sheetView = (View) ReflectUtils.invokeMethod(sheet, "requireView");
+
+                        if (sheetView != null) {
+                            sheetView.post(() -> addLastOnlineView(sheetView, userId));
                         }
-                    } catch (Throwable ignored) {}
-                })
-            );
-        } catch (Throwable ignored) {}
-
-        // 3. Fallback للربط مع UserProfileHeaderView
-        try {
-            patcher.patch(
-                "com.discord.widgets.user.profile.UserProfileHeaderView",
-                "updateBio",
-                new Class<?>[]{ CharSequence.class, long.class },
-                new Hook(param -> {
-                    try {
-                        View headerView = (View) param.thisObject;
-                        long userId = (long) param.args[1];
-                        headerView.post(() -> injectLastOnlineView(headerView, userId));
                     } catch (Throwable ignored) {}
                 })
             );
         } catch (Throwable ignored) {}
     }
 
-    private void injectLastOnlineView(View rootView, long userId) {
+    private void addLastOnlineView(View sheetView, long userId) {
         try {
-            Context ctx = rootView.getContext();
-            TextView lastOnlineTv = rootView.findViewById(LAST_ONLINE_VIEW_ID);
+            Context ctx = sheetView.getContext();
+
+            // العثور على الحاوية العلوية أسفل اسم المستخدم
+            int aboutMeId = ctx.getResources().getIdentifier("about_me_card", "id", ctx.getPackageName());
+            int contentId = ctx.getResources().getIdentifier("user_sheet_content", "id", ctx.getPackageName());
+
+            View targetAnchor = (aboutMeId != 0) ? sheetView.findViewById(aboutMeId) : null;
+            ViewGroup container = null;
+
+            if (targetAnchor != null && targetAnchor.getParent() instanceof ViewGroup) {
+                container = (ViewGroup) targetAnchor.getParent();
+            } else if (contentId != 0) {
+                View contentView = sheetView.findViewById(contentId);
+                if (contentView instanceof ViewGroup) {
+                    container = (ViewGroup) contentView;
+                }
+            }
+
+            if (container == null && sheetView instanceof ViewGroup) {
+                container = (ViewGroup) sheetView;
+            }
+
+            if (container == null) return;
+
+            TextView tv = sheetView.findViewById(LAST_ONLINE_VIEW_ID);
 
             long lastSeen = settings.getLong(String.valueOf(userId), 0L);
-            String displayText;
+            String text;
 
             if (lastSeen > 0) {
                 long diff = System.currentTimeMillis() - lastSeen;
+                long days = diff / (1000 * 60 * 60 * 24);
+
                 if (diff < 60000) {
-                    displayText = "LastOnline: Active Now";
+                    text = "Last online: Active Now";
+                } else if (days == 0) {
+                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (Today)";
                 } else {
-                    displayText = "LastOnline: " + dateFormat.format(new Date(lastSeen));
+                    text = "Last online: " + dateFormat.format(new Date(lastSeen)) + " (" + days + " days ago)";
                 }
             } else {
-                displayText = "LastOnline: Unknown (Waiting for activity)";
+                text = "Last online: Unknown (No data recorded)";
             }
 
-            if (lastOnlineTv == null) {
-                lastOnlineTv = new TextView(ctx);
-                lastOnlineTv.setId(LAST_ONLINE_VIEW_ID);
-                lastOnlineTv.setTextSize(13f);
-                lastOnlineTv.setTypeface(Typeface.DEFAULT_BOLD);
-                lastOnlineTv.setTextColor(Color.parseColor("#B9BBBE"));
+            if (tv == null) {
+                tv = new TextView(ctx);
+                tv.setId(LAST_ONLINE_VIEW_ID);
+                tv.setTextSize(12f);
+                tv.setTextColor(Color.parseColor("#B9BBBE"));
 
-                int pad = DimenUtils.dpToPx(6);
-                lastOnlineTv.setPadding(pad, pad, pad, pad);
+                int padStart = DimenUtils.dpToPx(16);
+                int padBottom = DimenUtils.dpToPx(4);
+                tv.setPadding(padStart, 0, padStart, padBottom);
 
-                // محاولة إيجاد حاوية البايو أو إضافتها لأسفل الواجهة
-                int bioId = ctx.getResources().getIdentifier("user_profile_header_bio", "id", ctx.getPackageName());
-                View bioView = (bioId != 0) ? rootView.findViewById(bioId) : null;
-
-                if (bioView != null && bioView.getParent() instanceof ViewGroup) {
-                    ViewGroup parent = (ViewGroup) bioView.getParent();
-                    int index = parent.indexOfChild(bioView);
-                    parent.addView(lastOnlineTv, index + 1);
-                } else if (rootView instanceof ViewGroup) {
-                    ((ViewGroup) rootView).addView(lastOnlineTv);
+                // إضافته في آخر عنصر قبل كارت About Me ليظهر أسفل Last message
+                if (targetAnchor != null) {
+                    int index = container.indexOfChild(targetAnchor);
+                    container.addView(tv, Math.max(0, index));
+                } else {
+                    container.addView(tv);
                 }
             }
 
-            lastOnlineTv.setText(displayText);
+            tv.setText(text);
         } catch (Throwable ignored) {}
     }
 
