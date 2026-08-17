@@ -1,6 +1,7 @@
 package com.aliucord.plugins;
 
 import android.content.Context;
+import android.graphics.Color;
 import android.graphics.Typeface;
 import android.view.View;
 import android.view.ViewGroup;
@@ -27,7 +28,7 @@ public class LastOnline extends Plugin {
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. تتبع تحديثات حالة المستخدمين وحفظ وقت التواجد
+        // 1. Hook presence updates to track when users are online, idle, or dnd
         patcher.patch(
             StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Map.class),
             new Hook(param -> {
@@ -36,16 +37,26 @@ public class LastOnline extends Plugin {
                     if (updates == null) return;
 
                     long now = System.currentTimeMillis();
+
                     for (Map.Entry<?, ?> entry : updates.entrySet()) {
+                        Object key = entry.getKey();
                         Object val = entry.getValue();
+
                         if (val instanceof Presence) {
                             Presence presence = (Presence) val;
-                            String status = presence.getStatus() != null 
-                                    ? presence.getStatus().toLowerCase(Locale.ROOT) 
-                                    : "offline";
+                            String status = extractStatus(presence);
 
                             if (status.equals("online") || status.equals("idle") || status.equals("dnd")) {
-                                settings.setLong(String.valueOf(presence.getUserId()), now);
+                                long targetId = 0L;
+                                if (key instanceof Number) {
+                                    targetId = ((Number) key).longValue();
+                                } else if (key instanceof String) {
+                                    targetId = Long.parseLong((String) key);
+                                }
+
+                                if (targetId != 0L) {
+                                    settings.setLong(String.valueOf(targetId), now);
+                                }
                             }
                         }
                     }
@@ -53,7 +64,7 @@ public class LastOnline extends Plugin {
             })
         );
 
-        // 2. التعديل على واجهة البروفايل لإضافة النص أسفل البايو (About Me)
+        // 2. Patch Profile About Me UI
         patcher.patch(
             "com.discord.widgets.user.profile.UserProfileHeaderView",
             "updateBio",
@@ -61,9 +72,22 @@ public class LastOnline extends Plugin {
             new Hook(param -> {
                 View headerView = (View) param.thisObject;
                 long userId = (long) param.args[1];
+
                 headerView.post(() -> renderLastOnline(headerView, userId));
             })
         );
+    }
+
+    private String extractStatus(Presence presence) {
+        if (presence == null || presence.getStatus() == null) return "offline";
+        try {
+            Object clientStatus = presence.getStatus();
+            String statusStr = clientStatus.toString().toLowerCase(Locale.ROOT);
+            if (statusStr.contains("online")) return "online";
+            if (statusStr.contains("idle")) return "idle";
+            if (statusStr.contains("dnd")) return "dnd";
+        } catch (Throwable ignored) {}
+        return "offline";
     }
 
     private void renderLastOnline(View headerView, long userId) {
@@ -71,10 +95,9 @@ public class LastOnline extends Plugin {
             Context ctx = headerView.getContext();
             TextView lastOnlineTv = headerView.findViewById(LAST_ONLINE_VIEW_ID);
 
-            Presence currentPresence = StoreStream.getPresences().getPresence(userId);
-            String currentStatus = currentPresence != null && currentPresence.getStatus() != null 
-                    ? currentPresence.getStatus().toLowerCase(Locale.ROOT) 
-                    : "offline";
+            Map<Long, Presence> presencesMap = StoreStream.getPresences().getPresences();
+            Presence currentPresence = presencesMap != null ? presencesMap.get(userId) : null;
+            String currentStatus = extractStatus(currentPresence);
 
             String displayText;
             if (currentStatus.equals("online") || currentStatus.equals("idle") || currentStatus.equals("dnd")) {
@@ -92,8 +115,19 @@ public class LastOnline extends Plugin {
                 lastOnlineTv.setId(LAST_ONLINE_VIEW_ID);
                 lastOnlineTv.setTextSize(12f);
                 lastOnlineTv.setTypeface(Typeface.DEFAULT_BOLD);
-                lastOnlineTv.setTextColor(ColorCompat.getThemedColor(ctx, com.lytefast.flexpad.R.attr.text_muted));
-                
+
+                // Safe fallback for text color without referencing R.attr directly
+                try {
+                    int attrId = ctx.getResources().getIdentifier("text_muted", "attr", ctx.getPackageName());
+                    if (attrId != 0) {
+                        lastOnlineTv.setTextColor(ColorCompat.getThemedColor(ctx, attrId));
+                    } else {
+                        lastOnlineTv.setTextColor(Color.GRAY);
+                    }
+                } catch (Throwable e) {
+                    lastOnlineTv.setTextColor(Color.GRAY);
+                }
+
                 int pad = DimenUtils.dpToPx(4);
                 lastOnlineTv.setPadding(0, pad, 0, pad);
 
