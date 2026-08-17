@@ -24,61 +24,62 @@ import java.util.Map;
 public class LastOnline extends Plugin {
 
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("dd/MM/yy, HH:mm:ss", Locale.getDefault());
-    private static final int VIEW_ID = View.generateViewId();
+    private final int lastOnlineViewId = View.generateViewId();
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Presence Tracker
+        // 1. Presence Listener
         try {
-            for (java.lang.reflect.Method m : StoreStream.getPresences().getClass().getDeclaredMethods()) {
-                if (m.getName().equals("handlePresenceUpdate") || m.getName().equals("onPresencesLoaded")) {
-                    patcher.patch(m, new Hook(param -> {
-                        if (param.args != null && param.args.length > 0 && param.args[0] != null) {
-                            processPresence(param.args[0]);
-                        }
+            for (java.lang.reflect.Method method : StoreStream.getPresences().getClass().getDeclaredMethods()) {
+                if (method.getName().equals("handlePresenceUpdate") || method.getName().equals("onPresencesLoaded")) {
+                    patcher.patch(method, new Hook(param -> {
+                        try {
+                            if (param.args != null && param.args.length > 0 && param.args[0] != null) {
+                                processPresences(param.args[0]);
+                            }
+                        } catch (Throwable ignored) {}
                     }));
                 }
             }
         } catch (Throwable ignored) {}
 
-        // 2. Exact BetterUserDetails Hook
-        ClassLoader classLoader = context.getClassLoader();
-        Class<?> userSheetClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
-        Class<?> loadedClass = classLoader.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
+        // 2. Exact BetterUserDetails hook: WidgetUserSheet.configureNote
+        ClassLoader cl = context.getClassLoader();
+        Class<?> userSheetClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
+        Class<?> loadedClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
 
-        // Hook configureUI & configureNote
-        for (java.lang.reflect.Method method : userSheetClass.getDeclaredMethods()) {
-            if (method.getName().equals("configureUI") || method.getName().equals("configureNote")) {
-                Class<?>[] params = method.getParameterTypes();
-                if (params.length == 1 && params[0].isAssignableFrom(loadedClass)) {
-                    patcher.patch(method, new Hook(param -> {
-                        try {
-                            Object sheet = param.thisObject;
-                            Object loadedState = param.args[0];
-                            if (sheet == null || loadedState == null) return;
+        patcher.patch(
+            userSheetClass.getDeclaredMethod("configureNote", loadedClass),
+            new Hook(param -> {
+                try {
+                    Object sheet = param.thisObject;
+                    Object loadedState = param.args[0];
+                    if (sheet == null || loadedState == null) return;
 
-                            User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
-                            if (user == null) return;
+                    // Extract User
+                    User user = (User) ReflectUtils.invokeMethod(loadedState, "getUser");
+                    if (user == null) return;
 
-                            long userId = user.getId();
+                    long userId = user.getId();
 
-                            // Retrieve Discord ViewBinding
-                            Object binding = ReflectUtils.getField(sheet, "binding");
-                            if (binding == null) return;
+                    // Access binding
+                    Object binding = ReflectUtils.getField(sheet, "binding");
+                    if (binding == null) return;
 
-                            View aboutMeCard = (View) ReflectUtils.getField(binding, "aboutMeCard");
-                            if (aboutMeCard == null || !(aboutMeCard.getParent() instanceof ViewGroup)) return;
+                    // Access aboutMeCard and its parent container (user_sheet_content)
+                    View aboutMeCard = (View) ReflectUtils.getField(binding, "aboutMeCard");
+                    if (aboutMeCard == null || !(aboutMeCard.getParent() instanceof ViewGroup)) return;
 
-                            ViewGroup parentContainer = (ViewGroup) aboutMeCard.getParent();
-                            parentContainer.post(() -> renderRow(parentContainer, aboutMeCard, userId));
-                        } catch (Throwable ignored) {}
-                    }));
-                }
-            }
-        }
+                    ViewGroup parent = (ViewGroup) aboutMeCard.getParent();
+
+                    // Render LastOnline
+                    renderLastOnline(parent, aboutMeCard, userId);
+                } catch (Throwable ignored) {}
+            })
+        );
     }
 
-    private void processPresence(Object data) {
+    private void processPresences(Object data) {
         try {
             if (data instanceof Map) {
                 Map<?, ?> map = (Map<?, ?>) data;
@@ -89,7 +90,7 @@ public class LastOnline extends Plugin {
                     } else if (entry.getKey() instanceof String) {
                         try { uid = Long.parseLong((String) entry.getKey()); } catch (Throwable ignored) {}
                     }
-                    saveIfActive(uid, entry.getValue());
+                    checkAndStore(uid, entry.getValue());
                 }
             } else {
                 long uid = 0L;
@@ -106,13 +107,13 @@ public class LastOnline extends Plugin {
                 }
 
                 if (uid != 0L) {
-                    saveIfActive(uid, data);
+                    checkAndStore(uid, data);
                 }
             }
         } catch (Throwable ignored) {}
     }
 
-    private void saveIfActive(long userId, Object presenceObj) {
+    private void checkAndStore(long userId, Object presenceObj) {
         if (presenceObj == null || userId == 0L) return;
         String status = String.valueOf(presenceObj).toLowerCase(Locale.ROOT);
         if (status.contains("online") || status.contains("idle") || status.contains("dnd")) {
@@ -120,10 +121,12 @@ public class LastOnline extends Plugin {
         }
     }
 
-    private void renderRow(ViewGroup parentContainer, View aboutMeCard, long userId) {
+    private void renderLastOnline(ViewGroup parent, View aboutMeCard, long userId) {
         try {
-            Context ctx = parentContainer.getContext();
-            TextView tv = parentContainer.findViewById(VIEW_ID);
+            Context ctx = parent.getContext();
+
+            // Find or create the view
+            TextView tv = parent.findViewById(lastOnlineViewId);
 
             long lastSeen = settings.getLong(String.valueOf(userId), 0L);
             String text;
@@ -145,35 +148,41 @@ public class LastOnline extends Plugin {
 
             if (tv == null) {
                 tv = new TextView(ctx);
-                tv.setId(VIEW_ID);
+                tv.setId(lastOnlineViewId);
                 tv.setTextSize(12f);
                 tv.setTextColor(Color.parseColor("#B9BBBE"));
 
-                // Check if BetterUserDetails LinearLayout container exists
-                ViewGroup targetParent = parentContainer;
-                int targetIndex = parentContainer.indexOfChild(aboutMeCard);
-
-                // Look for BetterUserDetails container (it inserts a LinearLayout right before aboutMeCard)
-                for (int i = 0; i < parentContainer.getChildCount(); i++) {
-                    View child = parentContainer.getChildAt(i);
+                // Check if BetterUserDetails created its container
+                LinearLayout betterUserDetailsContainer = null;
+                for (int i = 0; i < parent.getChildCount(); i++) {
+                    View child = parent.getChildAt(i);
                     if (child instanceof LinearLayout && child != aboutMeCard) {
-                        targetParent = (LinearLayout) child;
-                        targetIndex = -1; // Append inside BetterUserDetails container
+                        betterUserDetailsContainer = (LinearLayout) child;
                         break;
                     }
                 }
 
-                if (targetParent == parentContainer) {
-                    int padStart = DimenUtils.dpToPx(16);
-                    int padBottom = DimenUtils.dpToPx(2);
-                    tv.setPadding(padStart, 0, padStart, padBottom);
-                    if (targetIndex >= 0) {
-                        parentContainer.addView(tv, targetIndex);
-                    } else {
-                        parentContainer.addView(tv);
-                    }
+                if (betterUserDetailsContainer != null) {
+                    // Append inside BetterUserDetails container as the last row
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    );
+                    lp.topMargin = DimenUtils.dpToPx(2);
+                    tv.setLayoutParams(lp);
+                    betterUserDetailsContainer.addView(tv);
                 } else {
-                    targetParent.addView(tv);
+                    // Standalone placement right before aboutMeCard
+                    int padH = DimenUtils.dpToPx(16);
+                    int padV = DimenUtils.dpToPx(2);
+                    tv.setPadding(padH, padV, padH, padV);
+
+                    int index = parent.indexOfChild(aboutMeCard);
+                    if (index >= 0) {
+                        parent.addView(tv, index);
+                    } else {
+                        parent.addView(tv);
+                    }
                 }
             }
 
