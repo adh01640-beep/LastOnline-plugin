@@ -11,9 +11,7 @@ import com.aliucord.annotations.AliucordPlugin;
 import com.aliucord.entities.Plugin;
 import com.aliucord.patcher.Hook;
 import com.aliucord.utils.DimenUtils;
-import com.discord.models.presence.Presence;
 import com.discord.stores.StoreStream;
-import com.discord.utilities.color.ColorCompat;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -28,7 +26,7 @@ public class LastOnline extends Plugin {
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Hook presence updates to track when users are online, idle, or dnd
+        // 1. Hook presence updates
         patcher.patch(
             StoreStream.getPresences().getClass().getDeclaredMethod("handlePresenceUpdate", Map.class),
             new Hook(param -> {
@@ -37,16 +35,13 @@ public class LastOnline extends Plugin {
                     if (updates == null) return;
 
                     long now = System.currentTimeMillis();
-
                     for (Map.Entry<?, ?> entry : updates.entrySet()) {
                         Object key = entry.getKey();
                         Object val = entry.getValue();
 
-                        if (val instanceof Presence) {
-                            Presence presence = (Presence) val;
-                            String status = extractStatus(presence);
-
-                            if (status.equals("online") || status.equals("idle") || status.equals("dnd")) {
+                        if (val != null) {
+                            String presenceStr = String.valueOf(val).toLowerCase(Locale.ROOT);
+                            if (presenceStr.contains("online") || presenceStr.contains("idle") || presenceStr.contains("dnd")) {
                                 long targetId = 0L;
                                 if (key instanceof Number) {
                                     targetId = ((Number) key).longValue();
@@ -72,22 +67,9 @@ public class LastOnline extends Plugin {
             new Hook(param -> {
                 View headerView = (View) param.thisObject;
                 long userId = (long) param.args[1];
-
                 headerView.post(() -> renderLastOnline(headerView, userId));
             })
         );
-    }
-
-    private String extractStatus(Presence presence) {
-        if (presence == null || presence.getStatus() == null) return "offline";
-        try {
-            Object clientStatus = presence.getStatus();
-            String statusStr = clientStatus.toString().toLowerCase(Locale.ROOT);
-            if (statusStr.contains("online")) return "online";
-            if (statusStr.contains("idle")) return "idle";
-            if (statusStr.contains("dnd")) return "dnd";
-        } catch (Throwable ignored) {}
-        return "offline";
     }
 
     private void renderLastOnline(View headerView, long userId) {
@@ -95,19 +77,18 @@ public class LastOnline extends Plugin {
             Context ctx = headerView.getContext();
             TextView lastOnlineTv = headerView.findViewById(LAST_ONLINE_VIEW_ID);
 
-            Map<Long, Presence> presencesMap = StoreStream.getPresences().getPresences();
-            Presence currentPresence = presencesMap != null ? presencesMap.get(userId) : null;
-            String currentStatus = extractStatus(currentPresence);
-
+            long lastSeen = settings.getLong(String.valueOf(userId), 0L);
             String displayText;
-            if (currentStatus.equals("online") || currentStatus.equals("idle") || currentStatus.equals("dnd")) {
-                displayText = "LastOnline: Active Now (" + currentStatus.toUpperCase(Locale.ROOT) + ")";
-                settings.setLong(String.valueOf(userId), System.currentTimeMillis());
+
+            if (lastSeen > 0) {
+                long diff = System.currentTimeMillis() - lastSeen;
+                if (diff < 60000) {
+                    displayText = "LastOnline: Active Now";
+                } else {
+                    displayText = "LastOnline: " + dateFormat.format(new Date(lastSeen));
+                }
             } else {
-                long lastSeen = settings.getLong(String.valueOf(userId), 0L);
-                displayText = lastSeen > 0 
-                        ? "LastOnline: " + dateFormat.format(new Date(lastSeen))
-                        : "LastOnline: Unknown (Not recorded yet)";
+                displayText = "LastOnline: Unknown (Not recorded yet)";
             }
 
             if (lastOnlineTv == null) {
@@ -115,18 +96,7 @@ public class LastOnline extends Plugin {
                 lastOnlineTv.setId(LAST_ONLINE_VIEW_ID);
                 lastOnlineTv.setTextSize(12f);
                 lastOnlineTv.setTypeface(Typeface.DEFAULT_BOLD);
-
-                // Safe fallback for text color without referencing R.attr directly
-                try {
-                    int attrId = ctx.getResources().getIdentifier("text_muted", "attr", ctx.getPackageName());
-                    if (attrId != 0) {
-                        lastOnlineTv.setTextColor(ColorCompat.getThemedColor(ctx, attrId));
-                    } else {
-                        lastOnlineTv.setTextColor(Color.GRAY);
-                    }
-                } catch (Throwable e) {
-                    lastOnlineTv.setTextColor(Color.GRAY);
-                }
+                lastOnlineTv.setTextColor(Color.parseColor("#B9BBBE"));
 
                 int pad = DimenUtils.dpToPx(4);
                 lastOnlineTv.setPadding(0, pad, 0, pad);
