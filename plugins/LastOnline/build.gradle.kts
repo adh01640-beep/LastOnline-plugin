@@ -10,3 +10,4 @@ aliucord {
     version = "1.0.0"
     deploy.set(true)
 }
+
