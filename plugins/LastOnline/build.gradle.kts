@@ -5,8 +5,9 @@ plugins {
 }
 
 android {
+    namespace = "com.aliucord.plugins.lastonline"
     compileSdk = 34
-    
+
     defaultConfig {
         minSdk = 21
     }
@@ -14,7 +15,7 @@ android {
 
 aliucord {
     author("Adham", 0L)
-    description = "Displays the user's last online timestamp on their profile."
+    description = "Shows last online presence timestamp."
     version = "1.0.1"
     deploy.set(true)
 }
