@@ -30,7 +30,7 @@ public class LastOnline extends Plugin {
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Track live Gateway presence updates
+        // 1. Hook presence events to record timestamps
         try {
             for (Method method : StoreStream.getPresences().getClass().getDeclaredMethods()) {
                 if (method.getName().equals("handlePresenceUpdate") || method.getName().equals("onPresencesLoaded")) {
@@ -38,7 +38,7 @@ public class LastOnline extends Plugin {
                     patcher.patch(method, new Hook(param -> {
                         try {
                             if (param.args != null && param.args.length > 0 && param.args[0] != null) {
-                                processPresence(param.args[0]);
+                                processPresences(param.args[0]);
                             }
                         } catch (Throwable ignored) {}
                     }));
@@ -46,7 +46,7 @@ public class LastOnline extends Plugin {
             }
         } catch (Throwable ignored) {}
 
-        // 2. Hook WidgetUserSheet.configureNote (Matching BetterUserDetails's insertion lifecycle)
+        // 2. Hook WidgetUserSheet.configureNote (Matching BetterUserDetails lifecycle)
         ClassLoader cl = context.getClassLoader();
         Class<?> userSheetClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
         Class<?> loadedClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
@@ -80,7 +80,7 @@ public class LastOnline extends Plugin {
         }));
     }
 
-    private void processPresence(Object data) {
+    private void processPresences(Object data) {
         try {
             if (data instanceof Map) {
                 Map<?, ?> map = (Map<?, ?>) data;
@@ -142,7 +142,6 @@ public class LastOnline extends Plugin {
             Context ctx = parent.getContext();
             long lastSeen = settings.getLong(String.valueOf(userId), 0L);
 
-            // Check Discord memory presence
             try {
                 Map<?, ?> presences = (Map<?, ?>) ReflectUtils.invokeMethod(StoreStream.getPresences(), "getPresences");
                 if (presences != null && presences.containsKey(userId)) {
@@ -162,7 +161,6 @@ public class LastOnline extends Plugin {
                 displayText = "Last online: Unknown";
             }
 
-            // Find BetterUserDetails container or fallback to parent container
             ViewGroup targetContainer = parent;
             for (int i = 0; i < parent.getChildCount(); i++) {
                 View child = parent.getChildAt(i);
