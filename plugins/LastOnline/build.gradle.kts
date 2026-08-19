@@ -5,16 +5,16 @@ plugins {
 }
 
 android {
-    sourceSets {
-        named("main") {
-            java.srcDirs("src/main/kotlin", "src/main/java")
-        }
+    compileSdk = 34
+    
+    defaultConfig {
+        minSdk = 21
     }
 }
 
 aliucord {
     author("Adham", 0L)
-    description = "Shows last online presence timestamp."
+    description = "Displays the user's last online timestamp on their profile."
     version = "1.0.1"
     deploy.set(true)
 }
