@@ -30,7 +30,7 @@ public class LastOnline extends Plugin {
 
     @Override
     public void start(Context context) throws Throwable {
-        // 1. Gateway Presence Updates Hook
+        // 1. Track live Gateway presence updates
         try {
             for (Method method : StoreStream.getPresences().getClass().getDeclaredMethods()) {
                 if (method.getName().equals("handlePresenceUpdate") || method.getName().equals("onPresencesLoaded")) {
@@ -46,7 +46,7 @@ public class LastOnline extends Plugin {
             }
         } catch (Throwable ignored) {}
 
-        // 2. WidgetUserSheet.configureNote Hook (Same target as BetterUserDetails)
+        // 2. Hook WidgetUserSheet.configureNote (Matching BetterUserDetails's insertion lifecycle)
         ClassLoader cl = context.getClassLoader();
         Class<?> userSheetClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheet");
         Class<?> loadedClass = cl.loadClass("com.discord.widgets.user.usersheet.WidgetUserSheetViewModel$ViewState$Loaded");
@@ -162,6 +162,7 @@ public class LastOnline extends Plugin {
                 displayText = "Last online: Unknown";
             }
 
+            // Find BetterUserDetails container or fallback to parent container
             ViewGroup targetContainer = parent;
             for (int i = 0; i < parent.getChildCount(); i++) {
                 View child = parent.getChildAt(i);
@@ -172,6 +173,14 @@ public class LastOnline extends Plugin {
             }
 
             TextView tv = targetContainer.findViewWithTag(LAST_ONLINE_TAG);
+            if (tv == null) {
+                tv = parent.findViewWithTag(LAST_ONLINE_TAG);
+                if (tv != null && tv.getParent() instanceof ViewGroup) {
+                    ((ViewGroup) tv.getParent()).removeView(tv);
+                    tv = null;
+                }
+            }
+
             if (tv == null) {
                 tv = new TextView(ctx);
                 tv.setTag(LAST_ONLINE_TAG);
